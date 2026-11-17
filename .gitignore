@@ -1,0 +1,6 @@
+# Local data, secrets, uploads and SQLite files stay out of version control.
+.urbaneye-data/
+data/
+.env
+__pycache__/
+*.py[cod]
