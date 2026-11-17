@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UrbanEye AI application server. Standard library only; deploy behind HTTPS."""
+"""UrbanEye AI application server backed by Supabase Postgres and private Storage."""
 from __future__ import annotations
 
 import base64
@@ -10,26 +10,30 @@ import mimetypes
 import os
 import re
 import secrets
-import sqlite3
 import time
 import uuid
-import tempfile
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, unquote, urlparse
+from urllib.request import Request, urlopen
+
+import psycopg
+from psycopg.rows import dict_row
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("URBANEYE_DATA_DIR", Path(tempfile.gettempdir()) / "urbaneye-ai-data")).resolve()
-UPLOAD_DIR = DATA_DIR / "uploads"
-DB_PATH = DATA_DIR / "urbaneye.sqlite3"
-HOST = os.environ.get("HOST", "127.0.0.1")
+HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
 SESSION_HOURS = int(os.environ.get("SESSION_HOURS", "24"))
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") not in ("0", "false", "False")
 ADMIN_INVITE = os.environ.get("URBANEYE_ADMIN_INVITE", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
+STORAGE_BUCKET = os.environ.get("SUPABASE_STORAGE_BUCKET", "urbaneye-evidence")
 MAX_BODY = 9 * 1024 * 1024
 MAX_IMAGE = 6 * 1024 * 1024
 ITERATIONS = 310_000
@@ -41,63 +45,48 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def connect() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, timeout=10)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys = ON")
-    return con
+def connect():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured.")
+    return psycopg.connect(DATABASE_URL, sslmode=os.environ.get("DB_SSLMODE", "require"), row_factory=dict_row)
 
 
 def initialize() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_SECRET_KEY must be configured.")
     with connect() as db:
-        db.executescript("""
-        PRAGMA journal_mode=WAL;
-        CREATE TABLE IF NOT EXISTS users (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          name TEXT NOT NULL,
-          email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          password_hash BLOB NOT NULL,
-          password_salt BLOB NOT NULL,
-          role TEXT NOT NULL DEFAULT 'Citizen' CHECK(role IN ('Citizen','Administrator')),
-          created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS sessions (
-          token_hash TEXT PRIMARY KEY,
-          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-          expires_at INTEGER NOT NULL,
-          created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
-        CREATE TABLE IF NOT EXISTS reports (
-          id TEXT PRIMARY KEY,
-          user_id INTEGER NOT NULL REFERENCES users(id),
-          type TEXT NOT NULL,
-          location TEXT NOT NULL,
-          area TEXT NOT NULL,
-          severity TEXT NOT NULL CHECK(severity IN ('Low','Medium','High')),
-          description TEXT NOT NULL DEFAULT '',
-          latitude REAL,
-          longitude REAL,
-          image_key TEXT,
-          status TEXT NOT NULL DEFAULT 'Pending',
-          admin_note TEXT NOT NULL DEFAULT '',
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS reports_created ON reports(created_at DESC);
-        CREATE TABLE IF NOT EXISTS status_history (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          report_id TEXT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
-          user_id INTEGER NOT NULL REFERENCES users(id),
-          old_status TEXT NOT NULL,
-          new_status TEXT NOT NULL,
-          note TEXT NOT NULL DEFAULT '',
-          created_at TEXT NOT NULL
-        );
-        """)
-        db.execute("DELETE FROM sessions WHERE expires_at < ?", (int(time.time()),))
+        db.execute("DELETE FROM public.sessions WHERE expires_at < %s", (int(time.time()),))
+
+
+def storage_request(method: str, key: str, data: bytes | None = None, content_type: str | None = None) -> bytes:
+    if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+        raise RuntimeError("Supabase Storage is not configured.")
+    object_path = quote(key, safe="/")
+    if method == "GET":
+        endpoint = f"{SUPABASE_URL}/storage/v1/object/authenticated/{quote(STORAGE_BUCKET, safe='')}/{object_path}"
+    else:
+        endpoint = f"{SUPABASE_URL}/storage/v1/object/{quote(STORAGE_BUCKET, safe='')}/{object_path}"
+    headers = {"apikey": SUPABASE_SECRET_KEY, "Authorization": f"Bearer {SUPABASE_SECRET_KEY}"}
+    if content_type:
+        headers["Content-Type"] = content_type
+    if method == "POST":
+        headers["x-upsert"] = "false"
+    req = Request(endpoint, data=data, headers=headers, method=method)
+    try:
+        with urlopen(req, timeout=25) as response:
+            return response.read()
+    except HTTPError as exc:
+        detail = exc.read(500).decode("utf-8", "replace")
+        raise RuntimeError(f"Supabase Storage returned HTTP {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError("Could not reach Supabase Storage.") from exc
+
+
+def delete_storage_object(key: str) -> None:
+    try:
+        storage_request("DELETE", key)
+    except Exception as exc:
+        print(f"Storage cleanup warning: {exc}")
 
 
 def password_digest(password: str, salt: bytes) -> bytes:
@@ -109,7 +98,7 @@ def token_hash(token: str) -> str:
 
 
 class Handler(SimpleHTTPRequestHandler):
-    server_version = "UrbanEye/1.0"
+    server_version = "UrbanEye/1.1"
     sys_version = ""
 
     def __init__(self, *args, **kwargs):
@@ -117,16 +106,6 @@ class Handler(SimpleHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args) -> None:
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
-
-    def translate_path(self, path: str) -> str:
-        # Do not let the static file handler expose dotfiles, the SQLite store,
-        # or uploaded evidence, even if a deployment accidentally puts data in ROOT.
-        parts = [unquote(p) for p in urlparse(path).path.split("/") if p]
-        candidate = (ROOT / Path(*parts)).resolve()
-        private_roots = (DATA_DIR, UPLOAD_DIR)
-        if any(part.startswith(".") for part in parts) or any(candidate == root or root in candidate.parents for root in private_roots):
-            return str(ROOT / "__urbaneye_private_file_not_found__")
-        return super().translate_path(path)
 
     def end_headers(self) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -137,7 +116,13 @@ class Handler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def send_json(self, value, status=HTTPStatus.OK, extra_headers=()) -> None:
-        raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        def serialize(item):
+            if isinstance(item, datetime):
+                return item.isoformat()
+            if isinstance(item, (bytes, bytearray)):
+                return base64.b64encode(item).decode("ascii")
+            raise TypeError(f"Cannot JSON encode {type(item).__name__}")
+        raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=serialize).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -175,7 +160,7 @@ class Handler(SimpleHTTPRequestHandler):
             return origin.rstrip("/") == expected.rstrip("/")
         parsed = urlparse(origin)
         host = self.headers.get("Host", "").split(":", 1)[0].lower()
-        return parsed.hostname and parsed.hostname.lower() == host
+        return bool(parsed.hostname and parsed.hostname.lower() == host)
 
     def session_user(self):
         cookie = SimpleCookie()
@@ -183,9 +168,12 @@ class Handler(SimpleHTTPRequestHandler):
         morsel = cookie.get("urbaneye_session")
         if not morsel:
             return None
-        key = token_hash(morsel.value)
         with connect() as db:
-            row = db.execute("SELECT u.id,u.name,u.email,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?", (key, int(time.time()))).fetchone()
+            row = db.execute(
+                "SELECT u.id,u.name,u.email,u.role FROM public.sessions s "
+                "JOIN public.users u ON u.id=s.user_id WHERE s.token_hash=%s AND s.expires_at>%s",
+                (token_hash(morsel.value), int(time.time())),
+            ).fetchone()
         return dict(row) if row else None
 
     def require_user(self):
@@ -198,8 +186,11 @@ class Handler(SimpleHTTPRequestHandler):
         token = secrets.token_urlsafe(36)
         expiry = int(time.time()) + SESSION_HOURS * 3600
         with connect() as db:
-            db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
-            db.execute("INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)", (token_hash(token), user_id, expiry, now_iso()))
+            db.execute("DELETE FROM public.sessions WHERE user_id=%s", (user_id,))
+            db.execute(
+                "INSERT INTO public.sessions(token_hash,user_id,expires_at,created_at) VALUES(%s,%s,%s,%s)",
+                (token_hash(token), user_id, expiry, now_iso()),
+            )
         attrs = f"urbaneye_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_HOURS * 3600}"
         if COOKIE_SECURE:
             attrs += "; Secure"
@@ -208,7 +199,12 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
-            return self.send_json({"ok": True, "service": "UrbanEye AI"})
+            try:
+                with connect() as db:
+                    db.execute("SELECT 1")
+                return self.send_json({"ok": True, "service": "UrbanEye AI"})
+            except Exception:
+                return self.send_json({"ok": False, "service": "UrbanEye AI"}, HTTPStatus.SERVICE_UNAVAILABLE)
         if path == "/api/session":
             user = self.session_user()
             if not user:
@@ -219,7 +215,13 @@ class Handler(SimpleHTTPRequestHandler):
             if not user:
                 return
             with connect() as db:
-                rows = db.execute("SELECT r.id,r.user_id,r.type,r.location,r.area,r.severity,r.description,r.latitude,r.longitude,r.image_key,r.status,r.admin_note,r.created_at,r.updated_at,u.name AS reporter_name FROM reports r JOIN users u ON u.id=r.user_id WHERE (?='Administrator' OR r.user_id=?) ORDER BY r.created_at DESC", (user["role"], user["id"])).fetchall()
+                rows = db.execute(
+                    "SELECT r.id,r.user_id,r.type,r.location,r.area,r.severity,r.description,r.latitude,r.longitude,"
+                    "r.image_key,r.status,r.admin_note,r.created_at,r.updated_at,u.name AS reporter_name "
+                    "FROM public.reports r JOIN public.users u ON u.id=r.user_id "
+                    "WHERE (%s='Administrator' OR r.user_id=%s) ORDER BY r.created_at DESC",
+                    (user["role"], user["id"]),
+                ).fetchall()
             return self.send_json({"reports": [dict(r) for r in rows]})
         if path.startswith("/api/uploads/"):
             user = self.require_user()
@@ -229,14 +231,19 @@ class Handler(SimpleHTTPRequestHandler):
             if not re.fullmatch(r"[a-f0-9]{32}\.(?:jpg|png|webp)", key):
                 return self.send_json({"error": "Image not found."}, HTTPStatus.NOT_FOUND)
             with connect() as db:
-                found = db.execute("SELECT 1 FROM reports WHERE image_key=? AND (?='Administrator' OR user_id=?)", (key, user["role"], user["id"])).fetchone()
-            file = UPLOAD_DIR / key
-            if not found or not file.is_file():
+                found = db.execute(
+                    "SELECT 1 FROM public.reports WHERE image_key=%s AND (%s='Administrator' OR user_id=%s)",
+                    (key, user["role"], user["id"]),
+                ).fetchone()
+            if not found:
                 return self.send_json({"error": "Image not found."}, HTTPStatus.NOT_FOUND)
-            data = file.read_bytes()
+            try:
+                data = storage_request("GET", key)
+            except Exception:
+                return self.send_json({"error": "Could not retrieve report evidence."}, HTTPStatus.BAD_GATEWAY)
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", mimetypes.guess_type(key)[0] or "application/octet-stream")
-            self.send_header("Cache-Control", "private, max-age=3600")
+            self.send_header("Cache-Control", "private, max-age=300")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             return self.wfile.write(data)
@@ -265,15 +272,20 @@ class Handler(SimpleHTTPRequestHandler):
             digest = password_digest(password, salt)
             try:
                 with connect() as db:
-                    cur = db.execute("INSERT INTO users(name,email,password_hash,password_salt,role,created_at) VALUES(?,?,?,?,?,?)", (name, email, digest, salt, role, now_iso()))
-                    user_id = cur.lastrowid
-            except sqlite3.IntegrityError:
+                    row = db.execute(
+                        "INSERT INTO public.users(name,email,password_hash,password_salt,role,created_at) "
+                        "VALUES(%s,%s,%s,%s,%s,%s) RETURNING id",
+                        (name, email, digest, salt, role, now_iso()),
+                    ).fetchone()
+                    user_id = row["id"]
+            except psycopg.errors.UniqueViolation:
                 return self.send_json({"error": "An account with this email already exists."}, HTTPStatus.CONFLICT)
             with connect() as db:
-                row = db.execute("SELECT id,name,email,role FROM users WHERE id=?", (user_id,)).fetchone()
+                row = db.execute("SELECT id,name,email,role FROM public.users WHERE id=%s", (user_id,)).fetchone()
             return self.send_json({"user": dict(row)}, HTTPStatus.CREATED, [self.issue_session(user_id)])
         if path == "/api/auth/login":
-            forwarded = self.headers.get('X-Forwarded-For', '').strip(); ip = forwarded.split(',')[-1].strip() if forwarded else self.client_address[0]
+            forwarded = self.headers.get("X-Forwarded-For", "").strip()
+            ip = forwarded.split(",")[-1].strip() if forwarded else self.client_address[0]
             attempts = [t for t in LOGIN_LIMIT.get(ip, []) if t > time.time() - 900]
             if len(attempts) >= 12:
                 return self.send_json({"error": "Too many sign-in attempts. Try again in 15 minutes."}, HTTPStatus.TOO_MANY_REQUESTS)
@@ -283,17 +295,26 @@ class Handler(SimpleHTTPRequestHandler):
             email = str(data.get("email", "")).strip().lower()
             password = str(data.get("password", ""))
             with connect() as db:
-                row = db.execute("SELECT id,name,email,password_hash,password_salt,role FROM users WHERE email=?", (email,)).fetchone()
+                row = db.execute(
+                    "SELECT id,name,email,password_hash,password_salt,role FROM public.users WHERE email=%s",
+                    (email,),
+                ).fetchone()
             if not row or not hmac.compare_digest(password_digest(password, row["password_salt"]), row["password_hash"]):
-                attempts.append(time.time()); LOGIN_LIMIT[ip] = attempts
+                attempts.append(time.time())
+                LOGIN_LIMIT[ip] = attempts
                 return self.send_json({"error": "Email or password is incorrect."}, HTTPStatus.UNAUTHORIZED)
             LOGIN_LIMIT.pop(ip, None)
-            return self.send_json({"user": {"id": row["id"], "name": row["name"], "email": row["email"], "role": row["role"]}}, extra_headers=[self.issue_session(row["id"])])
+            return self.send_json(
+                {"user": {"id": row["id"], "name": row["name"], "email": row["email"], "role": row["role"]}},
+                extra_headers=[self.issue_session(row["id"])],
+            )
         if path == "/api/auth/logout":
-            cookie = SimpleCookie(); cookie.load(self.headers.get("Cookie", "")); morsel = cookie.get("urbaneye_session")
+            cookie = SimpleCookie()
+            cookie.load(self.headers.get("Cookie", ""))
+            morsel = cookie.get("urbaneye_session")
             if morsel:
                 with connect() as db:
-                    db.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash(morsel.value),))
+                    db.execute("DELETE FROM public.sessions WHERE token_hash=%s", (token_hash(morsel.value),))
             attrs = "urbaneye_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0" + ("; Secure" if COOKIE_SECURE else "")
             return self.send_json({"ok": True}, extra_headers=[("Set-Cookie", attrs)])
         if path == "/api/reports":
@@ -310,7 +331,8 @@ class Handler(SimpleHTTPRequestHandler):
             description = str(data.get("description", "")).strip()
             if not issue or len(issue) > 60 or not location or len(location) > 160 or not area or len(area) > 120 or severity not in {"Low", "Medium", "High"} or len(description) > 2000:
                 return self.send_json({"error": "Check the issue, location, area, severity and description fields."}, HTTPStatus.BAD_REQUEST)
-            lat = data.get("latitude"); lon = data.get("longitude")
+            lat = data.get("latitude")
+            lon = data.get("longitude")
             try:
                 lat = float(lat) if lat not in (None, "") else None
                 lon = float(lon) if lon not in (None, "") else None
@@ -335,16 +357,27 @@ class Handler(SimpleHTTPRequestHandler):
                 if not valid:
                     return self.send_json({"error": "The image content does not match its file type."}, HTTPStatus.BAD_REQUEST)
                 image_key = uuid.uuid4().hex + {"jpeg": ".jpg", "png": ".png", "webp": ".webp"}[kind]
-                (UPLOAD_DIR / image_key).write_bytes(content)
+                try:
+                    storage_request("POST", image_key, content, f"image/{kind}")
+                except Exception:
+                    return self.send_json({"error": "The evidence photo could not be saved. Please try again."}, HTTPStatus.BAD_GATEWAY)
             report_id = "UE-" + uuid.uuid4().hex[:8].upper()
             timestamp = now_iso()
             try:
                 with connect() as db:
-                    db.execute("INSERT INTO reports(id,user_id,type,location,area,severity,description,latitude,longitude,image_key,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?, 'Pending',?,?)", (report_id, user["id"], issue, location, area, severity, description, lat, lon, image_key, timestamp, timestamp))
-                    db.execute("INSERT INTO status_history(report_id,user_id,old_status,new_status,created_at) VALUES(?,?,?,?,?)", (report_id, user["id"], "New", "Pending", timestamp))
+                    db.execute(
+                        "INSERT INTO public.reports(id,user_id,type,location,area,severity,description,latitude,longitude,image_key,status,created_at,updated_at) "
+                        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'Pending',%s,%s)",
+                        (report_id, user["id"], issue, location, area, severity, description, lat, lon, image_key, timestamp, timestamp),
+                    )
+                    db.execute(
+                        "INSERT INTO public.status_history(report_id,user_id,old_status,new_status,created_at) "
+                        "VALUES(%s,%s,%s,%s,%s)",
+                        (report_id, user["id"], "New", "Pending", timestamp),
+                    )
             except Exception:
                 if image_key:
-                    (UPLOAD_DIR / image_key).unlink(missing_ok=True)
+                    delete_storage_object(image_key)
                 raise
             return self.send_json({"id": report_id, "status": "Pending"}, HTTPStatus.CREATED)
         return self.send_json({"error": "Not found."}, HTTPStatus.NOT_FOUND)
@@ -369,13 +402,19 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({"error": "Choose a valid report status and keep remarks under 2,000 characters."}, HTTPStatus.BAD_REQUEST)
         report_id = match.group(1)
         with connect() as db:
-            row = db.execute("SELECT status FROM reports WHERE id=?", (report_id,)).fetchone()
+            row = db.execute("SELECT status FROM public.reports WHERE id=%s", (report_id,)).fetchone()
             if not row:
                 return self.send_json({"error": "Report not found."}, HTTPStatus.NOT_FOUND)
             timestamp = now_iso()
             if row["status"] != status:
-                db.execute("INSERT INTO status_history(report_id,user_id,old_status,new_status,note,created_at) VALUES(?,?,?,?,?,?)", (report_id, user["id"], row["status"], status, note, timestamp))
-            db.execute("UPDATE reports SET status=?,admin_note=?,updated_at=? WHERE id=?", (status, note, timestamp, report_id))
+                db.execute(
+                    "INSERT INTO public.status_history(report_id,user_id,old_status,new_status,note,created_at) VALUES(%s,%s,%s,%s,%s,%s)",
+                    (report_id, user["id"], row["status"], status, note, timestamp),
+                )
+            db.execute(
+                "UPDATE public.reports SET status=%s,admin_note=%s,updated_at=%s WHERE id=%s",
+                (status, note, timestamp, report_id),
+            )
         return self.send_json({"ok": True, "id": report_id, "status": status})
 
     def do_DELETE(self):
@@ -383,18 +422,11 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({"error": "Reports are retained for an audit trail."}, HTTPStatus.METHOD_NOT_ALLOWED)
         return self.send_error(HTTPStatus.METHOD_NOT_ALLOWED)
 
-    def handle_error(self):
-        try:
-            super().handle_error()
-        except Exception:
-            pass
-
 
 def main() -> None:
     initialize()
-    print(f"UrbanEye AI listening at http://{HOST}:{PORT}")
-    print(f"SQLite data: {DB_PATH}")
-    print("Secure session cookies are enabled." if COOKIE_SECURE else "Local development mode: secure cookies disabled.")
+    print(f"UrbanEye AI listening on {HOST}:{PORT}")
+    print("Supabase Postgres and private Storage are configured.")
     if not ADMIN_INVITE:
         print("Admin accounts are disabled. Set URBANEYE_ADMIN_INVITE to enable administrator registration.")
     server = ThreadingHTTPServer((HOST, PORT), Handler)
