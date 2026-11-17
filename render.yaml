@@ -2,23 +2,25 @@ services:
   - type: web
     name: urbaneye-ai
     runtime: docker
-    plan: starter
+    plan: free
     region: singapore
     dockerfilePath: ./Dockerfile
     autoDeployTrigger: commit
     healthCheckPath: /api/health
-    disk:
-      name: urbaneye-data
-      mountPath: /data
-      sizeGB: 1
     envVars:
       - key: HOST
         value: 0.0.0.0
       - key: COOKIE_SECURE
         value: "1"
-      - key: URBANEYE_DATA_DIR
-        value: /data
       - key: SESSION_HOURS
         value: "24"
+      - key: SUPABASE_URL
+        value: https://pdhletdhtsaqutdbrvjb.supabase.co
+      - key: SUPABASE_STORAGE_BUCKET
+        value: urbaneye-evidence
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
       - key: URBANEYE_ADMIN_INVITE
         sync: false
