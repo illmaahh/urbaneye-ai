@@ -20,6 +20,8 @@ The included Docker Compose setup serves the app over HTTPS using Caddy and keep
 3. Open inbound ports 80 and 443 on the server, then run `docker compose up -d --build`.
 4. Open your HTTPS domain, create the administrator account with the invite, then share the public URL with teachers and users. People without the invite can create citizen accounts and submit reports.
 
+For Render, use the included `render.yaml` Blueprint. It creates a separate UrbanEye web service with a persistent 1 GB disk in Singapore, HTTPS, a health check and automatic deploys from `main`. Set `URBANEYE_ADMIN_INVITE` as a private environment value during the initial Blueprint setup. The web service uses Render's generated `onrender.com` URL; no custom domain is required.
+
 Keep `.env` private. Back up the `urbaneye_data` Docker volume regularly. Anyone holding the administrator invite can create an administrator account; rotate the invite after setting up the initial admins.
 
 ## What is real and what is still a project extension
