@@ -48,7 +48,7 @@ def now_iso() -> str:
 def connect():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured.")
-    return psycopg.connect(DATABASE_URL, sslmode=os.environ.get("DB_SSLMODE", "require"), row_factory=dict_row)
+    return psycopg.connect(DATABASE_URL, sslmode=os.environ.get("DB_SSLMODE", "require"), row_factory=dict_row, prepare_threshold=None)
 
 
 def initialize() -> None:
