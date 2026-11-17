@@ -1,39 +1,71 @@
 # UrbanEye AI
 
-UrbanEye is a shared infrastructure reporting application. Accounts, sessions, reports, status changes and uploaded evidence are stored by the server in SQLite. Passwords are PBKDF2 hashed; login sessions use random, server-side tokens in `HttpOnly`, `SameSite=Strict` cookies. The browser no longer stores accounts or reports in local storage.
+**UrbanEye** is a shared city-operations workspace for reporting and tracking street-level infrastructure issues. It gives community members a place to submit reports and lets administrators review reports and update their status.
 
-## Run on this computer
+**Live application:** https://urbaneye-ai-0hh8.onrender.com
 
-1. Open PowerShell in this folder and run `.\start.ps1`.
-2. On first run, copy the administrator invite code printed in the terminal.
-3. Open `http://localhost:8000`, choose **Create an account**, enter your name and email, and use that invite code for the administrator account.
-4. Share the local address with other people on this computer. Their accounts and reports are stored in the same database.
+## Project overview
 
-The local server is bound to this computer only. Other teachers cannot reach it over the internet until it is deployed to a public server.
+The dashboard is labelled **City Operations · Bhopal** and includes:
+- Citizen account registration and sign-in.
+- Report submission with issue type, location, area, severity, description and optional photo evidence.
+- A shared report workspace with report status and history.
+- Administrator access for reviewing reports and updating their status.
+- Overview metrics, report trends and an illustrative issue-location map.
 
-## Publish for teachers and other users
+## Technology
 
-The included Docker Compose setup serves the app over HTTPS using Caddy and keeps the database and uploaded photos in persistent Docker volumes.
+- **Frontend:** HTML, CSS and JavaScript in `index.html`.
+- **Backend:** Python HTTP server in `server.py`.
+- **Database:** Supabase PostgreSQL.
+- **Evidence storage:** Private Supabase Storage bucket named `urbaneye-evidence`.
+- **Hosting:** Render Web Service (Singapore region).
+- **Deployment:** GitHub `main` branch with automatic deployment enabled.
 
-1. Provision a Linux server with Docker and Docker Compose, and point your domain's DNS records to that server.
-2. Copy `.env.example` to `.env`. Set `DOMAIN` and `PUBLIC_ORIGIN` to your real domain. Replace `URBANEYE_ADMIN_INVITE` with a long random secret.
-3. Open inbound ports 80 and 443 on the server, then run `docker compose up -d --build`.
-4. Open your HTTPS domain, create the administrator account with the invite, then share the public URL with teachers and users. People without the invite can create citizen accounts and submit reports.
+## Deployment configuration
 
-For Render, use the included `render.yaml` Blueprint. It creates a separate UrbanEye web service with a persistent 1 GB disk in Singapore, HTTPS, a health check and automatic deploys from `main`. Set `URBANEYE_ADMIN_INVITE` as a private environment value during the initial Blueprint setup. The web service uses Render's generated `onrender.com` URL; no custom domain is required.
+The deployed service uses these environment variables:
 
-Keep `.env` private. Back up the `urbaneye_data` Docker volume regularly. Anyone holding the administrator invite can create an administrator account; rotate the invite after setting up the initial admins.
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | Supabase PostgreSQL connection string (use the Session Pooler connection for Render) |
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_SECRET_KEY` | Server-side Supabase secret key |
+| `SUPABASE_STORAGE_BUCKET` | Private evidence bucket; `urbaneye-evidence` |
+| `URBANEYE_ADMIN_INVITE` | Private invite code required to create administrator accounts |
+| `HOST` | Server bind address; `0.0.0.0` on Render |
+| `COOKIE_SECURE` | Enables secure session cookies on HTTPS |
+| `SESSION_HOURS` | Session lifetime in hours |
 
-## What is real and what is still a project extension
+**Security:** Keep database credentials, the Supabase secret key and the administrator invite code private. Do not commit them to GitHub or include them in screenshots or presentations. The browser does not receive the Supabase secret key. Uploaded evidence is stored in a private bucket and delivered through the application after the user's access is checked.
 
-- Real now: shared account registration and sign-in, server-side sessions, sign-out, role-based report visibility, report creation, optional photo storage, administrator status changes, and persistent shared SQLite data.
-- Administrator accounts require the private invite code. Ordinary registrations receive citizen access.
-- Still to connect: email verification and password recovery, a trained YOLO inference service, live geocoding and map tiles, and a production email provider. The map illustration is labelled and does not imply real GPS positions.
-- The SQLite setup fits a small project deployment. A larger public service should move to a managed PostgreSQL database and add monitoring, backups and an email verification provider.
+## Database setup
 
-## Main files
+The SQL schema is in `supabase/schema.sql`. Run it in the Supabase SQL Editor when creating a new project. It creates the application tables and indexes and enables row-level security. The backend connects to PostgreSQL using the server-side database connection string.
 
-- `index.html` — responsive web interface.
-- `server.py` — application API, authentication, permissions, database and private image delivery.
-- `compose.yaml`, `Dockerfile`, `Caddyfile` — HTTPS deployment setup.
-- `start.ps1` — local Windows launcher; creates a private local admin invite on first run.
+## Running and deploying
+
+The production app is hosted at the live URL above. To deploy code changes, push commits to the `main` branch; Render is configured to deploy new commits automatically.
+
+For a new deployment:
+1. Create a Supabase project and run `supabase/schema.sql` in its SQL Editor.
+2. Create a **private** Storage bucket named `urbaneye-evidence`.
+3. Create a Render web service from this repository using the included `Dockerfile` / `render.yaml`.
+4. Set the required environment variables in Render. Use the Supabase Session Pooler connection string for `DATABASE_URL`.
+5. Keep `SUPABASE_SECRET_KEY` and `URBANEYE_ADMIN_INVITE` private.
+
+## Current scope and limitations
+
+- The issue map uses illustrative markers and locations; it is not connected to live GIS or GPS data.
+- The image-review panel currently shows demonstration output; a trained image-classification or object-detection model is not connected.
+- Email verification and password recovery are not yet configured.
+- This is a student project prototype, not a live municipal dispatch system.
+
+## Repository structure
+
+- `index.html` — responsive frontend and client-side interactions.
+- `server.py` — API, authentication, authorization, PostgreSQL access and private evidence delivery.
+- `supabase/schema.sql` — database tables, indexes and row-level security setup.
+- `requirements.txt` — Python dependencies.
+- `Dockerfile` — container build configuration.
+- `render.yaml` — Render service configuration.
