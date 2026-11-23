@@ -13,6 +13,14 @@ The dashboard is labelled **City Operations · Bhopal** and includes:
 - Administrator access for reviewing reports and updating their status.
 - Overview metrics, report trends and an illustrative issue-location map.
 
+  
+## GrowthX Off Campus
+
+I'm participating in GrowthX Off Campus, sponsored by AWS.
+
+**My Off Campus referral code: FZ4SYM**
+
+
 ## Technology
 
 - **Frontend:** HTML, CSS and JavaScript in `index.html`.
